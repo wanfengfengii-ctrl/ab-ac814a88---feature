@@ -5,6 +5,11 @@
 
     python scripts/smoke.py            # 直测求解器
     BASE_URL=http://web:8000 python scripts/smoke.py   # 走 HTTP
+
+包含两组场景：
+
+1. 旧口径回归：4x4 栅格漏读 + 划痕亮点 + 抖动（不带轴向不确定度）；
+2. 轴向不确定度：误差带内零残差采用、误差带外越限量计入容差/弃点。
 """
 
 import json
@@ -116,13 +121,100 @@ def check_result(result):
     )
 
 
-def main():
-    points, _ = build_case()
+# ---------------------------------------------------------------------------
+# 轴向不确定度（误差带）冒烟
+# ---------------------------------------------------------------------------
+VB3 = {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}}
+
+
+def _band_base_payload(points, tolerance, max_outliers):
+    markers = []
+    for t in points:
+        m = {"id": t[0], "x": t[1], "y": t[2]}
+        if len(t) >= 4 and t[3] is not None:
+            m["coordinate_uncertainty"] = {"x": t[3][0], "y": t[3][1]}
+        markers.append(m)
+    return {
+        "points": markers,
+        "rows": 3,
+        "cols": 3,
+        "max_outliers": max_outliers,
+        "tolerance": tolerance,
+        "origin_bounds": VB3,
+        "row_vector_bounds": VB3,
+        "col_vector_bounds": VB3,
+    }
+
+
+def check_band_results(run):
+    # 3x3 精确栅格 O=(0,0)、A=(2,0)、B=(0,2)，id 按行主序：
+    # 第 r 行第 c 列坐标为 (2r, 2c)，id=2 的真值为 (0,2)。
+    exact = [(r * 3 + c + 1, 2 * r, 2 * c) for r in range(3) for c in range(3)]
+
+    # 场景一：中心报为 (1,2)、x 半宽 1 → 观测区间 [0,2] 覆盖真值。
+    # 误差带内有效残差为 0：容差 0、零弃点即可复原全部 9 个标记。
+    in_band = [
+        (i, x + 1, y, (1, 0)) if i == 2 else (i, x, y)
+        for i, x, y in exact
+    ]
+    r1 = run(_band_base_payload(in_band, tolerance=0, max_outliers=0))
+    assert r1["solvable"] is True, r1.get("reason")
+    p = r1["parameters"]
+    assert (p["origin"], p["row_vector"], p["col_vector"]) == (
+        [0, 0],
+        [2, 0],
+        [0, 2],
+    )
+    assert r1["objective"] == {
+        "discarded_count": 0,
+        "max_manhattan_residual": 0,
+        "total_manhattan_residual": 0,
+    }
+    a2 = next(a for a in r1["assignments"] if a["id"] == 2)
+    assert a2["predicted"] == [0, 2]
+    assert a2["residual"] == [1, 0]
+    assert a2["effective_residual"] == [0, 0]
+    assert a2["manhattan_residual"] == 0
+    print("  误差带内：越轴距离计 0，容差 0 下零弃点零残差复原")
+
+    # 场景二：中心报为 (-2,2)、x 半宽 1 → 区间 [-3,-1]，真值越界 1。
+    out_band = [
+        (i, x - 2, y, (1, 0)) if i == 2 else (i, x, y)
+        for i, x, y in exact
+    ]
+    # 2a：容差 0、不许弃点 → 明确无解（真实栅格冲突，区别于量测不确定度）
+    r2 = run(_band_base_payload(out_band, tolerance=0, max_outliers=0))
+    assert r2["solvable"] is False
+    assert "容差" in r2["reason"], r2["reason"]
+    # 2b：容差 0、允许 1 弃点 → id=2 被弃，证据有效 L∞ 恰为越界量 1
+    r3 = run(_band_base_payload(out_band, tolerance=0, max_outliers=1))
+    assert r3["solvable"] is True, r3.get("reason")
+    assert r3["objective"]["discarded_count"] == 1
+    d = r3["discarded"][0]
+    assert d["id"] == 2
+    assert d["coordinate_uncertainty"] == [1, 0]
+    assert d["nearest_inf_residual"] == 1
+    assert d["cells_within_tolerance"] == []
+    # 2c：容差 1 → 越界量 1 被计入，最大/总和曼哈顿残差均为 1
+    r4 = run(_band_base_payload(out_band, tolerance=1, max_outliers=0))
+    assert r4["solvable"] is True, r4.get("reason")
+    assert (
+        r4["objective"]["discarded_count"],
+        r4["objective"]["max_manhattan_residual"],
+        r4["objective"]["total_manhattan_residual"],
+    ) == (0, 1, 1)
+    a2b = next(a for a in r4["assignments"] if a["id"] == 2)
+    assert a2b["effective_residual"] == [1, 0]
+    assert a2b["manhattan_residual"] == 1
+    print("  误差带外：越界 1 计为有效残差；无解原因 / 弃点证据 / 放宽容差均正确")
+
+
+def _run(payload):
+    """有 BASE_URL 时走 HTTP，否则直测求解器。"""
     base_url = os.environ.get("BASE_URL")
     if base_url:
         import urllib.request
 
-        payload = expected_payload(points)
         req = urllib.request.Request(
             base_url.rstrip("/") + "/api/wafer-grids/reconstruct",
             data=json.dumps(payload).encode(),
@@ -130,13 +222,34 @@ def main():
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
-        print(f"==> 通过 HTTP ({base_url}) 冒烟")
-    else:
-        result = reconstruct(points, 4, 4, 1, 2, BOUNDS)
-        print("==> 直测求解器冒烟")
-    check_result(result)
-    print("==> 冒烟通过：漏读 4 格 + 2 划痕亮点均正确处理")
+            return json.loads(resp.read())
+    points = []
+    for m in payload["points"]:
+        u = m.get("coordinate_uncertainty")
+        if u is None:
+            points.append((m["id"], m["x"], m["y"]))
+        else:
+            points.append((m["id"], m["x"], m["y"], (u["x"], u["y"])))
+    return reconstruct(
+        points,
+        payload["rows"],
+        payload["cols"],
+        payload["tolerance"],
+        payload["max_outliers"],
+        BOUNDS,
+    )
+
+
+def main():
+    points, _ = build_case()
+    via = f"HTTP ({os.environ['BASE_URL']})" if os.environ.get("BASE_URL") else "求解器直测"
+    print(f"==> 场景一：旧口径回归（漏读 + 划痕亮点 + 抖动），{via}")
+    check_result(_run(expected_payload(points)))
+
+    print(f"==> 场景二：轴向不确定度（误差带内零残差 / 带外超限），{via}")
+    check_band_results(_run)
+
+    print("==> 冒烟通过：旧口径回归与误差带场景均正确处理")
 
 
 if __name__ == "__main__":

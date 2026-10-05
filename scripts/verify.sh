@@ -7,7 +7,7 @@ cd /app
 echo "==> [1/2] 单元测试 (pytest)"
 python -m pytest -q
 
-echo "==> [2/2] 复原冒烟（漏读标记 + 划痕亮点）"
+echo "==> [2/2] 复原冒烟（旧口径回归 + 轴向不确定度：带内零残差 / 带外超限）"
 python scripts/smoke.py
 
 echo "==> VERIFY OK"

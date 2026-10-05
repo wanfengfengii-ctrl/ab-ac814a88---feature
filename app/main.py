@@ -9,14 +9,29 @@ from .solver import reconstruct
 app = FastAPI(
     title="Wafer Grid Reconstruction API",
     description="从带编号的无序整数坐标中恢复栅格原点、基向量与格位分配。",
-    version="1.0.0",
+    version="1.1.0",
 )
+
+
+class CoordinateUncertainty(BaseModel):
+    """标记的轴向不确定半宽（非负整数，0–3）；预测坐标落入
+    [x-w, x+w] × [y-w, y+w] 观测区间的轴向残差计为 0。"""
+
+    x: int = Field(..., ge=0, le=3, description="x 轴半宽")
+    y: int = Field(..., ge=0, le=3, description="y 轴半宽")
 
 
 class Marker(BaseModel):
     id: int = Field(..., description="标记唯一编号")
     x: int
     y: int
+    coordinate_uncertainty: CoordinateUncertainty | None = Field(
+        None,
+        description=(
+            "选填的 x、y 轴向不确定半宽（0–3 的非负整数）；"
+            "省略时两轴半宽均为 0"
+        ),
+    )
 
 
 class Interval(BaseModel):
@@ -71,7 +86,22 @@ async def health():
 @app.post("/api/wafer-grids/reconstruct")
 async def reconstruct_grid(req: ReconstructRequest):
     # 按编号排序：字典序决胜项定义在“按编号排列的分配序列”上
-    points = sorted(((p.id, p.x, p.y) for p in req.points), key=lambda t: t[0])
+    points = sorted(
+        (
+            (
+                p.id,
+                p.x,
+                p.y,
+                (
+                    (p.coordinate_uncertainty.x, p.coordinate_uncertainty.y)
+                    if p.coordinate_uncertainty is not None
+                    else None
+                ),
+            )
+            for p in req.points
+        ),
+        key=lambda t: t[0],
+    )
     bounds = {
         "origin": _bounds_pair(req.origin_bounds),
         "row_vector": _bounds_pair(req.row_vector_bounds),
