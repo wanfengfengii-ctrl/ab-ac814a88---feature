@@ -5,6 +5,8 @@
 
     python scripts/smoke.py            # 直测求解器
     BASE_URL=http://web:8000 python scripts/smoke.py   # 走 HTTP
+
+共三个场景：旧版无误差带请求回归、误差带内零残差、误差带外超限计残差。
 """
 
 import json
@@ -20,6 +22,7 @@ BOUNDS = {
     "row_vector": ([-3, 3], [-3, 3]),
     "col_vector": ([-3, 3], [-3, 3]),
 }
+VB = {"x": {"lo": -3, "hi": 3}, "y": {"lo": -3, "hi": 3}}
 
 
 def build_case():
@@ -116,13 +119,105 @@ def check_result(result):
     )
 
 
-def main():
-    points, _ = build_case()
+# ---------------------------------------------------------------------------
+# 场景二：低信噪标记带轴向量测不确定度（误差带）
+# ---------------------------------------------------------------------------
+def build_band_case():
+    """3x3 栅格 O=(0,0)、A=(2,0)、B=(0,2)，9 个标记全部读到。
+
+    两个低信噪标记只给误差带：
+
+    - id=1 真格位 (0,0)，报告中心 (1,0)、x 半宽 1：预测点 (0,0) 落入
+      区间 [0,2]，有效残差 0（误差带内零残差）；
+    - id=9 真格位 (2,2)=(4,4)，报告中心 (6,4)、x 半宽 1：预测点 (4,4)
+      越出区间 [5,7] 一个单位，有效残差 1（误差带外超限计入目标）。
+    """
+    points = []
+    pid = 1
+    for r in range(3):
+        for c in range(3):
+            points.append((pid, 2 * r, 2 * c))
+            pid += 1
+    points[0] = (1, 1, 0, (1, 0))   # 误差带内
+    points[8] = (9, 6, 4, (1, 0))   # 误差带外 1 个单位
+    return points
+
+
+def band_payload(points):
+    markers = []
+    for t in points:
+        i, x, y = t[0], t[1], t[2]
+        hx, hy = t[3] if len(t) >= 4 else (0, 0)
+        marker = {"id": i, "x": x, "y": y}
+        if len(t) >= 4:
+            marker["coordinate_uncertainty"] = {"x": hx, "y": hy}
+        markers.append(marker)
+    return {
+        "points": markers,
+        "rows": 3,
+        "cols": 3,
+        "max_outliers": 0,
+        "tolerance": 1,
+        "origin_bounds": VB,
+        "row_vector_bounds": VB,
+        "col_vector_bounds": VB,
+    }
+
+
+def check_band_result(result):
+    assert result["solvable"] is True, result.get("reason")
+    p = result["parameters"]
+    assert (p["origin"], p["row_vector"], p["col_vector"]) == (
+        [0, 0],
+        [2, 0],
+        [0, 2],
+    ), p
+    obj = result["objective"]
+    assert obj["discarded_count"] == 0, obj
+    assert obj["max_manhattan_residual"] == 1, obj
+    assert obj["total_manhattan_residual"] == 1, obj
+
+    by_id = {a["id"]: a for a in result["assignments"]}
+    adopted = list(by_id.values())
+    cells = {(a["row"], a["col"]) for a in adopted}
+    assert len(cells) == 9, "两个标记占用了同一格位"
+
+    # 误差带内：原始偏差非零，但有效残差归零
+    a1 = by_id[1]
+    assert (a1["row"], a1["col"]) == (0, 0)
+    assert a1["predicted"] == [0, 0]
+    assert a1["residual"] == [1, 0]
+    assert a1["effective_residual"] == [0, 0]
+    assert a1["manhattan_residual"] == 0
+    assert a1["observation_interval"] == [[0, 2], [0, 0]]
+    assert a1["coordinate_uncertainty"] == [1, 0]
+
+    # 误差带外：只计越出区间的 1 个单位
+    a9 = by_id[9]
+    assert (a9["row"], a9["col"]) == (2, 2)
+    assert a9["predicted"] == [4, 4]
+    assert a9["residual"] == [2, 0]
+    assert a9["effective_residual"] == [1, 0]
+    assert a9["manhattan_residual"] == 1
+
+    # 逐点有效残差与汇总目标同一口径
+    assert max(a["manhattan_residual"] for a in adopted) == obj[
+        "max_manhattan_residual"
+    ]
+    assert sum(a["manhattan_residual"] for a in adopted) == obj[
+        "total_manhattan_residual"
+    ]
+    print(
+        "  id=1 误差带内有效残差 [0,0]；id=9 误差带外有效残差 [1,0]，"
+        f"目标 = (k=0, max=1, sum=1)"
+    )
+
+
+def _submit(payload, direct_points, direct_kwargs):
     base_url = os.environ.get("BASE_URL")
     if base_url:
         import urllib.request
 
-        payload = expected_payload(points)
         req = urllib.request.Request(
             base_url.rstrip("/") + "/api/wafer-grids/reconstruct",
             data=json.dumps(payload).encode(),
@@ -130,13 +225,34 @@ def main():
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=30) as resp:
-            result = json.loads(resp.read())
-        print(f"==> 通过 HTTP ({base_url}) 冒烟")
-    else:
-        result = reconstruct(points, 4, 4, 1, 2, BOUNDS)
-        print("==> 直测求解器冒烟")
+            return json.loads(resp.read()), f"HTTP ({base_url})"
+    return reconstruct(direct_points, **direct_kwargs), "直测求解器"
+
+
+def main():
+    print("[场景 1] 旧版请求回归：漏读 4 格 + 2 划痕亮点（无 coordinate_uncertainty）")
+    points, _ = build_case()
+    result, via = _submit(
+        expected_payload(points),
+        points,
+        dict(rows=4, cols=4, tolerance=1, max_outliers=2, bounds=BOUNDS),
+    )
+    print(f"==> 通过 {via}")
     check_result(result)
-    print("==> 冒烟通过：漏读 4 格 + 2 划痕亮点均正确处理")
+    print("==> 场景 1 通过：旧版请求结果与既有版本一致")
+
+    print("[场景 2] 低信噪误差带：带内零残差 + 带外超限计残差")
+    band_points = build_band_case()
+    result, via = _submit(
+        band_payload(band_points),
+        band_points,
+        dict(rows=3, cols=3, tolerance=1, max_outliers=0, bounds=BOUNDS),
+    )
+    print(f"==> 通过 {via}")
+    check_band_result(result)
+    print("==> 场景 2 通过：误差带口径正确（量测不确定度未被误判为冲突）")
+
+    print("==> 冒烟全部通过")
 
 
 if __name__ == "__main__":

@@ -29,6 +29,18 @@ def grid_points(rows, cols, origin, av, bv):
     return pts
 
 
+def with_band(pts, overrides):
+    """把 {id: (hx, hy)} 写入点列（4 元组）。"""
+    out = []
+    for t in pts:
+        if t[0] in overrides:
+            out.append((t[0], t[1], t[2], overrides[t[0]]))
+        else:
+            out.append(t)
+    return out
+
+
+
 def test_exact_grid_recovers_parameters():
     pts = grid_points(3, 3, (0, 0), (2, 1), (-1, 2))
     res = reconstruct(pts, 3, 3, 0, 0, BOUNDS_WIDE)
@@ -170,6 +182,128 @@ def test_residual_componentwise_within_tolerance():
         if a["adopted"]:
             assert abs(a["residual"][0]) <= 1
             assert abs(a["residual"][1]) <= 1
+
+
+# ---------------------------------------------------------------------------
+# 轴向量测不确定度（误差带）
+# ---------------------------------------------------------------------------
+def test_zero_band_is_identical_to_no_band():
+    pts = grid_points(3, 3, (0, 0), (2, 0), (0, 2))
+    pts[0] = (1, 1, 0)  # 制造一个非精确点，确保残差字段确实参与比较
+    pts_band = [(i, x, y, (0, 0)) for i, x, y in pts]
+    r1 = reconstruct(pts, 3, 3, 1, 1, BOUNDS_WIDE)
+    r2 = reconstruct(pts_band, 3, 3, 1, 1, BOUNDS_WIDE)
+    # 半宽全 0 时所有既有字段必须逐值一致
+    for key in ("objective", "parameters", "assignments", "discarded"):
+        assert r1[key] == r2[key]
+
+
+def test_in_band_prediction_has_zero_effective_residual():
+    # 真格位 (0,0)；低信噪下报告中心偏到 (1,0)，x 半宽 1 覆盖真格位。
+    # tolerance=0：不提供误差带时该点无容差可达格位；提供后有效残差为 0。
+    pts = grid_points(3, 3, (0, 0), (2, 0), (0, 2))
+    pts[0] = (1, 1, 0)
+    no_band = reconstruct(pts, 3, 3, 0, 0, BOUNDS_WIDE)
+    assert no_band["solvable"] is False
+
+    banded = reconstruct(with_band(pts, {1: (1, 0)}), 3, 3, 0, 0, BOUNDS_WIDE)
+    assert banded["solvable"] is True, banded.get("reason")
+    obj = banded["objective"]
+    assert (
+        obj["discarded_count"],
+        obj["max_manhattan_residual"],
+        obj["total_manhattan_residual"],
+    ) == (0, 0, 0)
+    a1 = next(a for a in banded["assignments"] if a["id"] == 1)
+    assert a1["adopted"] is True
+    assert (a1["row"], a1["col"]) == (0, 0)
+    assert a1["predicted"] == [0, 0]
+    # 原始偏差仍按标记中心报告；有效残差在误差带内归零
+    assert a1["residual"] == [1, 0]
+    assert a1["effective_residual"] == [0, 0]
+    assert a1["manhattan_residual"] == 0
+    assert a1["observation_interval"] == [[0, 2], [0, 0]]
+    p = banded["parameters"]
+    assert (p["origin"], p["row_vector"], p["col_vector"]) == (
+        [0, 0],
+        [2, 0],
+        [0, 2],
+    )
+
+
+def test_single_axis_band_covers_only_that_axis():
+    pts = grid_points(3, 3, (0, 0), (2, 0), (0, 2))
+    # y 方向偏 1：仅给 y 半宽 → 有效残差 0；给 x 半宽则 y 仍越界
+    pts[0] = (1, 0, 1)
+    hy = reconstruct(with_band(pts, {1: (0, 1)}), 3, 3, 0, 0, BOUNDS_WIDE)
+    assert hy["solvable"] is True
+    a1 = next(a for a in hy["assignments"] if a["id"] == 1)
+    assert a1["effective_residual"] == [0, 0]
+    hx = reconstruct(with_band(pts, {1: (1, 0)}), 3, 3, 0, 0, BOUNDS_WIDE)
+    assert hx["solvable"] is False
+
+
+def test_out_of_band_distance_counts_into_objectives():
+    # id=1 真格位 (0,0)，报告中心 (2,0)、x 半宽 1（区间 [1,3]）：
+    # 格位 (0,0) 在区间外 1 个单位 → 有效残差 1，计入最大残差与残差和；
+    # 而吸附到精确格位 (2,0) 会挤掉 id=2，互异格位裁决不允许。
+    pts = grid_points(3, 3, (0, 0), (2, 0), (0, 2))
+    pts[0] = (1, 2, 0)
+    res = reconstruct(with_band(pts, {1: (1, 0)}), 3, 3, 1, 0, BOUNDS_WIDE)
+    assert res["solvable"] is True, res.get("reason")
+    obj = res["objective"]
+    assert (
+        obj["discarded_count"],
+        obj["max_manhattan_residual"],
+        obj["total_manhattan_residual"],
+    ) == (0, 1, 1)
+    by_id = {a["id"]: a for a in res["assignments"]}
+    assert (by_id[1]["row"], by_id[1]["col"]) == (0, 0)
+    assert by_id[1]["residual"] == [2, 0]
+    assert by_id[1]["effective_residual"] == [1, 0]
+    assert (by_id[2]["row"], by_id[2]["col"]) == (0, 1)
+    # 目标值与逐点有效残差同一口径
+    adopted = [a for a in res["assignments"] if a["adopted"]]
+    assert max(a["manhattan_residual"] for a in adopted) == obj[
+        "max_manhattan_residual"
+    ]
+    assert sum(a["manhattan_residual"] for a in adopted) == obj[
+        "total_manhattan_residual"
+    ]
+
+
+def test_beyond_band_plus_tolerance_is_real_conflict():
+    # tolerance=0 时其余 8 个精确点唯一钉住真栅格。id=1 中心 (3,0)：
+    # 半宽 1（区间 [2,4]）只覆盖格位 (2,0)，而该格位属于精确点 id=2，
+    # 互异格位 + 禁止弃点 → 明确无解（真实栅格冲突，而非量测不确定度）；
+    # 半宽放宽到 3（区间 [0,6] 覆盖空格位 (0,0)）即零残差采用。
+    pts = grid_points(3, 3, (0, 0), (2, 0), (0, 2))
+    pts[0] = (1, 3, 0)
+    tight = reconstruct(with_band(pts, {1: (1, 0)}), 3, 3, 0, 0, BOUNDS_WIDE)
+    assert tight["solvable"] is False
+    assert "容差" in tight["reason"]
+    wide = reconstruct(with_band(pts, {1: (3, 0)}), 3, 3, 0, 0, BOUNDS_WIDE)
+    assert wide["solvable"] is True
+    a1 = next(a for a in wide["assignments"] if a["id"] == 1)
+    assert (a1["row"], a1["col"]) == (0, 0)
+    assert a1["effective_residual"] == [0, 0]
+
+
+def test_band_discarded_evidence_uses_effective_distance():
+    # 误差带扩到极限仍够不到任何格位的划痕亮点：证据距离按有效口径，
+    # cells_within_tolerance 为空。
+    pts = grid_points(3, 3, (0, 0), (2, 0), (0, 2))
+    pts.append((42, 13, 13))
+    res = reconstruct(
+        with_band(pts, {42: (3, 3)}), 3, 3, 1, 1, BOUNDS_WIDE
+    )
+    assert res["solvable"] is True
+    d = next(x for x in res["discarded"] if x["id"] == 42)
+    assert d["coordinate_uncertainty"] == [3, 3]
+    assert d["nearest_inf_residual"] == 13 - 4 - 3  # 最近格位 (4,4)
+    assert d["nearest_manhattan_residual"] == 2 * (13 - 4 - 3)
+    assert d["cells_within_tolerance"] == []
+    assert "无可达格位" in d["reason"]
 
 
 if __name__ == "__main__":

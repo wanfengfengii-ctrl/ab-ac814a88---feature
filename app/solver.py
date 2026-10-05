@@ -8,8 +8,18 @@
 3. 曼哈顿残差总和；
 4. 完整参数与按编号排列的分配序列（字典序）。
 
-约束：``det(A, B) > 0``；被采用点的预测坐标逐分量不越过容差（L∞ ≤ tolerance）；
-任意两个标记不得占用同一格位。
+约束：``det(A, B) > 0``；被采用点的预测坐标逐分量不越过“观测区间 + 容差”
+（有效 L∞ ≤ tolerance）；任意两个标记不得占用同一格位。
+
+量测不确定度：每个标记可带 x/y 轴向半宽 ``hx, hy``（0~3 的非负整数），观测
+区间为 ``[x-hx, x+hx] × [y-hy, y+hy]``。预测坐标落入区间的方向有效残差为 0，
+仅越出区间的轴向距离计入残差::
+
+    eff_x = max(|px - cx| - hx, 0),  eff_y = max(|py - cy| - hy, 0)
+
+即边的可达条件为 ``|px-cx| ≤ tolerance+hx 且 |py-cy| ≤ tolerance+hy``，边权
+（曼哈顿残差）为 ``eff_x + eff_y``。半宽全为 0 时退化为按标记中心计残差，
+与不含量测不确定度的既有口径完全一致。
 
 枚举规模有界：六个分量各取自跨度 ≤ 6 的闭区间，至多 ``7**6`` 组参数，
 det 过滤、包围盒与邻域集合预过滤后，仅对候选参数运行二分图匹配
@@ -18,7 +28,6 @@ det 过滤、包围盒与邻域集合预过滤后，仅对候选参数运行二�
 
 from collections import deque
 from itertools import product
-from typing import Optional
 
 
 # ---------------------------------------------------------------------------
@@ -119,19 +128,34 @@ def _min_cost_flow(point_edges, n_points, n_cells, need, cap):
     return net.run(s, t, need)
 
 
+def _axis_eff(delta, half):
+    """轴向有效残差：预测点落入观测半宽内为 0，否则只计越出区间的距离。"""
+    ad = abs(delta)
+    return ad - half if ad > half else 0
+
+
 # ---------------------------------------------------------------------------
 # 主求解流程
 # ---------------------------------------------------------------------------
 def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
     """复原栅格。
 
-    points: [(id, x, y), ...]（调用方保证 7~14 个、编号唯一）。
+    points: [(id, x, y)] 或 [(id, x, y, (hx, hy))]（调用方保证 7~14 个、
+    编号唯一、半宽为 0~3 的非负整数；缺省半宽为 (0, 0)）。
     bounds: dict(origin=([lox,hix],[loy,hiy]), row_vector=..., col_vector=...)
     返回 dict；无解时返回 {"solvable": False, "reason": ...}。
     """
     n = len(points)
+
+    def _norm(t):
+        if len(t) >= 4 and t[3] is not None:
+            hx, hy = t[3]
+        else:
+            hx = hy = 0
+        return (t[0], t[1], t[2], hx, hy)
+
     # 字典序决胜定义在“按编号排列的分配序列”上，内部统一按编号排序
-    points = sorted(points, key=lambda t: t[0])
+    points = sorted((_norm(t) for t in points), key=lambda t: t[0])
     (oxr, oyr), (axr, ayr), (bxr, byr) = (
         bounds["origin"],
         bounds["row_vector"],
@@ -140,14 +164,21 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
 
     best = None  # (k, M, S)，参数与分配按枚举顺序天然保证字典序最小
 
-    # 容差较小时用邻域集合做快速计数；否则直接用边表
-    neighbor_offsets = None
-    if tolerance >= 0 and (2 * tolerance + 1) ** 2 <= 64:
-        neighbor_offsets = [
-            (dx, dy)
-            for dx in range(-tolerance, tolerance + 1)
-            for dy in range(-tolerance, tolerance + 1)
-        ]
+    # 第二级预过滤的逐点邻域窗口：误差带使各点窗口不同，窗口面积 ≤ 64 时
+    # 用集合查找，否则置 None 改为扫描格位；半宽全 0 且容差小时退化为原口径
+    point_offsets = []
+    for _, _px, _py, hx, hy in points:
+        tx, ty = tolerance + hx, tolerance + hy
+        if (2 * tx + 1) * (2 * ty + 1) <= 64:
+            point_offsets.append(
+                [
+                    (dx, dy)
+                    for dx in range(-tx, tx + 1)
+                    for dy in range(-ty, ty + 1)
+                ]
+            )
+        else:
+            point_offsets.append(None)
 
     for ox, oy, ax, ay, bx, by in product(
         range(oxr[0], oxr[1] + 1),
@@ -179,44 +210,60 @@ def reconstruct(points, rows, cols, tolerance, max_outliers, bounds):
                 if y > maxy:
                     maxy = y
 
-        # 第一级预过滤：包围盒（含容差扩张）
+        # 第一级预过滤：包围盒（含容差 + 各点误差带扩张）
         bbox_hits = 0
-        for _, px, py in points:
-            if minx - tolerance <= px <= maxx + tolerance and (
-                miny - tolerance <= py <= maxy + tolerance
+        for _, px, py, hx, hy in points:
+            if minx - tolerance - hx <= px <= maxx + tolerance + hx and (
+                miny - tolerance - hy <= py <= maxy + tolerance + hy
             ):
                 bbox_hits += 1
         if best is not None and bbox_hits < n - best[0][0]:
             continue
 
-        # 第二级预过滤：每个标记是否能在容差内落到某个格位
-        if neighbor_offsets is not None:
+        # 第二级预过滤：每个标记能否（连区间带容差）落到某个格位
+        if any(off is not None for off in point_offsets):
             cell_set = set(cells)
             near = 0
-            for _, px, py in points:
-                for dx, dy in neighbor_offsets:
-                    if (px + dx, py + dy) in cell_set:
-                        near += 1
-                        break
+            for p, (_, px, py, _hx, _hy) in enumerate(points):
+                offsets = point_offsets[p]
+                if offsets is not None:
+                    for dx, dy in offsets:
+                        if (px + dx, py + dy) in cell_set:
+                            near += 1
+                            break
+                else:
+                    hx, hy = points[p][3], points[p][4]
+                    tx = tolerance + hx
+                    ty = tolerance + hy
+                    for cx, cy in cells:
+                        if abs(px - cx) <= tx and abs(py - cy) <= ty:
+                            near += 1
+                            break
         else:
             near = 0
-            for _, px, py in points:
+            for _, px, py, hx, hy in points:
+                tx = tolerance + hx
+                ty = tolerance + hy
                 for cx, cy in cells:
-                    if abs(px - cx) <= tolerance and abs(py - cy) <= tolerance:
+                    if abs(px - cx) <= tx and abs(py - cy) <= ty:
                         near += 1
                         break
         if best is not None and near < n - best[0][0]:
             continue
 
-        # 构造边表：边仅在 L∞ <= tolerance 时存在
+        # 构造边表：有效逐分量残差 ≤ tolerance 时边才存在，边权为有效
+        # 曼哈顿残差（落入观测区间的轴向距离计 0）
         edges = [[] for _ in range(n)]
-        for p, (_, px, py) in enumerate(points):
+        for p, (_, px, py, hx, hy) in enumerate(points):
             pe = []
+            tx = tolerance + hx
+            ty = tolerance + hy
             for ci, (cx, cy) in enumerate(cells):
                 dx = px - cx
                 dy = py - cy
-                if abs(dx) <= tolerance and abs(dy) <= tolerance:
-                    pe.append((ci, abs(dx) + abs(dy)))
+                if abs(dx) <= tx and abs(dy) <= ty:
+                    mh = _axis_eff(dx, hx) + _axis_eff(dy, hy)
+                    pe.append((ci, mh))
             edges[p] = pe
 
         # 阶段一：最大化采用数（最小化弃点数）
@@ -384,38 +431,48 @@ def _build_response(
     assignments = []
     discarded = []
     used_cells = set()
-    for p, (pid, px, py) in enumerate(points):
+    for p, (pid, px, py, hx, hy) in enumerate(points):
         ci = assignment[p]
+        band = hx > 0 or hy > 0
         if ci == -1:
-            # 弃点证据：最近格位、最近曼哈顿距离、容差内候选格位
+            # 弃点证据：最近格位、最近有效曼哈顿/L∞残差、容差内候选格位。
+            # 距离一律按“观测区间 + 容差”的有效口径计算。
             best_c = -1
             best_mh = 10**18
             best_inf = 10**18
             within = []
             for cj, (cx, cy) in enumerate(cells):
-                dx = px - cx
-                dy = py - cy
-                mh = abs(dx) + abs(dy)
-                inf = max(abs(dx), abs(dy))
+                ex = _axis_eff(px - cx, hx)
+                ey = _axis_eff(py - cy, hy)
+                mh = ex + ey
+                inf = max(ex, ey)
                 if inf < best_inf or (inf == best_inf and mh < best_mh):
                     best_c = cj
                     best_mh = mh
                     best_inf = inf
                 if inf <= tolerance:
                     within.append([cj // cols, cj % cols])
+            if within:
+                reason = "容差内格位均须让给其他标记（互异格位约束）"
+            elif band:
+                reason = "观测区间扩张容差后仍无可达格位"
+            else:
+                # 无误差带时保持既有版本口径
+                reason = "容差内无可达格位"
             evidence = {
                 "id": pid,
                 "x": px,
                 "y": py,
+                "coordinate_uncertainty": [hx, hy],
+                "observation_interval": [
+                    [px - hx, px + hx],
+                    [py - hy, py + hy],
+                ],
                 "nearest_cell": [best_c // cols, best_c % cols],
                 "nearest_manhattan_residual": best_mh,
                 "nearest_inf_residual": best_inf,
                 "cells_within_tolerance": within,
-                "reason": (
-                    "容差内无可达格位"
-                    if not within
-                    else "容差内格位均须让给其他标记（互异格位约束）"
-                ),
+                "reason": reason,
             }
             discarded.append(evidence)
             assignments.append(
@@ -424,10 +481,12 @@ def _build_response(
                     "x": px,
                     "y": py,
                     "adopted": False,
+                    "coordinate_uncertainty": [hx, hy],
                     "row": None,
                     "col": None,
                     "predicted": None,
                     "residual": None,
+                    "effective_residual": None,
                     "manhattan_residual": None,
                 }
             )
@@ -437,17 +496,27 @@ def _build_response(
             r, c = divmod(ci, cols)
             cx, cy = cells[ci]
             dx, dy = px - cx, py - cy
+            ex, ey = _axis_eff(dx, hx), _axis_eff(dy, hy)
             assignments.append(
                 {
                     "id": pid,
                     "x": px,
                     "y": py,
                     "adopted": True,
+                    "coordinate_uncertainty": [hx, hy],
+                    "observation_interval": [
+                        [px - hx, px + hx],
+                        [py - hy, py + hy],
+                    ],
                     "row": r,
                     "col": c,
                     "predicted": [cx, cy],
+                    # 原始有符号偏差（观测标记中心 − 预测坐标）
                     "residual": [dx, dy],
-                    "manhattan_residual": abs(dx) + abs(dy),
+                    # 有效残差：落入观测区间的轴向为 0，越界只计区间外距离；
+                    # manhattan_residual / 目标值均按此口径
+                    "effective_residual": [ex, ey],
+                    "manhattan_residual": ex + ey,
                 }
             )
 
